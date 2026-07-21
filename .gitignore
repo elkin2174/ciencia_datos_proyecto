@@ -21,8 +21,8 @@ __pycache__/
 logs/
 
 # Copias de bases de datos
-backup/*
-backups/*
+backup/
+backups/
 *.backup
 *.dump
 *.dmp
@@ -36,6 +36,8 @@ bd_OLTP
 ~$*.pbix
 ~$*.xlsx
 ~$*.docx
+*.tmp
+*.temp
 
 # Configuración local de editores
 .vscode/

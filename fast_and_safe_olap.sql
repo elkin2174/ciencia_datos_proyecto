@@ -3,6 +3,10 @@
 -- Bodega de datos OLAP - PostgreSQL
 -- ============================================================
 
+\set ON_ERROR_STOP on
+
+BEGIN;
+
 -- Permite volver a ejecutar el archivo durante el desarrollo.
 DROP TABLE IF EXISTS ft_novedad_servicio;
 DROP TABLE IF EXISTS ft_fase_servicio;
@@ -220,11 +224,20 @@ CREATE INDEX idx_servicio_sede
 CREATE INDEX idx_servicio_mensajero
     ON ft_servicio(sk_mensajero);
 
+CREATE INDEX idx_servicio_hora
+    ON ft_servicio(id_hora_solicitud);
+
+CREATE INDEX idx_sede_cliente
+    ON dim_sede(sk_cliente);
+
 CREATE INDEX idx_fase_sk
     ON ft_fase_servicio(sk_fase);
 
 CREATE INDEX idx_novedad_tipo
     ON ft_novedad_servicio(sk_tipo_novedad);
+
+CREATE INDEX idx_novedad_servicio
+    ON ft_novedad_servicio(id_servicio);
 
 
 -- ============================================================
@@ -283,6 +296,8 @@ INSERT INTO dim_fase
 VALUES
     (1, 1, 'Iniciado'),
     (2, 2, 'Con mensajero asignado'),
-    (3, 4, 'Recogido en origen'),
+    (3, 4, 'Recogido por mensajero'),
     (4, 5, 'Entregado en destino'),
-    (5, 6, 'Cerrado');
+    (5, 6, 'Terminado completo');
+
+COMMIT;

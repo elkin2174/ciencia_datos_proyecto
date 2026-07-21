@@ -13,8 +13,8 @@ Requisitos:
     pip install pandas sqlalchemy psycopg2-binary python-dotenv
 
 Variables requeridas en .env:
-    OLTP_URI=postgresql+psycopg2://postgres:12345@localhost:5433/aquitoy_2
-    OLAP_URI=postgresql+psycopg2://postgres:12345@localhost:5433/olap_fastandsafe
+    OLTP_URI=postgresql+psycopg2://USUARIO:CONTRASENA@localhost:5433/aquitoy_2
+    OLAP_URI=postgresql+psycopg2://USUARIO:CONTRASENA@localhost:5433/olap_fastandsafe
 """
 
 from __future__ import annotations
@@ -80,8 +80,23 @@ class EtlStats:
     servicios_fuente: int
     estados_fuente: int
     novedades_fuente: int
+    fases_esperadas: int
     fases_repetidas: int
     fases_con_secuencia_invalida: int
+    sedes_cliente_inconsistentes: int
+    sedes_sin_relacion: int
+    clientes_desconocidos: int
+    sedes_desconocidas: int
+    mensajeros_desconocidos: int
+
+
+@dataclass(frozen=True)
+class SourceIds:
+    servicios_reales: frozenset[int]
+    servicios_prueba: frozenset[int]
+    novedades_validas: frozenset[int]
+    novedades_prueba: frozenset[int]
+    novedades_servicio_prueba: frozenset[int]
 
 
 # ============================================================
@@ -182,6 +197,7 @@ def extract_servicios(engine: Engine) -> pd.DataFrame:
                 hora_solicitud
             FROM mensajeria_servicio
             WHERE es_prueba = FALSE
+            ORDER BY id
             """
         ),
         engine,
@@ -203,6 +219,7 @@ def extract_estados(engine: Engine) -> pd.DataFrame:
                 ON s.id = e.servicio_id
             WHERE e.es_prueba = FALSE
               AND s.es_prueba = FALSE
+            ORDER BY e.id
             """
         ),
         engine,
@@ -224,6 +241,7 @@ def extract_novedades(engine: Engine) -> pd.DataFrame:
                 ON s.id = n.servicio_id
             WHERE n.es_prueba = FALSE
               AND s.es_prueba = FALSE
+            ORDER BY n.id
             """
         ),
         engine,
@@ -232,7 +250,7 @@ def extract_novedades(engine: Engine) -> pd.DataFrame:
 
 def extract_clientes(engine: Engine) -> pd.DataFrame:
     return pd.read_sql(
-        text("SELECT cliente_id, nombre FROM cliente"),
+        text("SELECT cliente_id, nombre FROM cliente ORDER BY cliente_id"),
         engine,
     )
 
@@ -250,6 +268,7 @@ def extract_sedes(engine: Engine) -> pd.DataFrame:
             FROM sede s
             LEFT JOIN ciudad c
                 ON c.ciudad_id = s.ciudad_id
+            ORDER BY s.sede_id
             """
         ),
         engine,
@@ -266,30 +285,25 @@ def extract_usuarios_sede(engine: Engine) -> pd.DataFrame:
                 cliente_id,
                 sede_id
             FROM clientes_usuarioaquitoy
+            ORDER BY id
             """
         ),
         engine,
     )
 
 
-def extract_mensajeros(engine):
-    return pd.read_sql("""
-        SELECT DISTINCT
-            m.id,
-            CONCAT(
-                COALESCE(
-                    NULLIF(
-                        TRIM(CONCAT_WS(' ', u.first_name, u.last_name)),
-                        ''
-                    ),
-                    'Mensajero'
-                ),
-                ' (', m.id, ')'
-            ) AS nombre_mensajero
-        FROM clientes_mensajeroaquitoy m
-        JOIN auth_user u
-            ON m.user_id = u.id
-    """, engine)
+def extract_mensajeros(engine: Engine) -> pd.DataFrame:
+    """Extrae solo la clave natural; los nombres se seudonimizan por diseño."""
+    return pd.read_sql(
+        text(
+            """
+            SELECT DISTINCT id
+            FROM clientes_mensajeroaquitoy
+            ORDER BY id
+            """
+        ),
+        engine,
+    )
 
 
 def extract_tipos_novedad(engine: Engine) -> pd.DataFrame:
@@ -298,9 +312,57 @@ def extract_tipos_novedad(engine: Engine) -> pd.DataFrame:
             """
             SELECT id AS id_tipo_novedad, nombre AS nom_tipo_novedad
             FROM mensajeria_tiponovedad
+            ORDER BY id
             """
         ),
         engine,
+    )
+
+
+def extract_source_ids(engine: Engine) -> SourceIds:
+    """Obtiene identificadores de control para validar exclusiones y cobertura."""
+    servicios = pd.read_sql(
+        text("SELECT id::bigint AS id_servicio, es_prueba FROM mensajeria_servicio"),
+        engine,
+    )
+    novedades = pd.read_sql(
+        text(
+            """
+            SELECT
+                n.id::bigint AS id_novedad_evento,
+                n.es_prueba,
+                s.es_prueba AS servicio_es_prueba
+            FROM mensajeria_novedadesservicio n
+            JOIN mensajeria_servicio s
+                ON s.id = n.servicio_id
+            """
+        ),
+        engine,
+    )
+
+    return SourceIds(
+        servicios_reales=frozenset(
+            servicios.loc[~servicios["es_prueba"], "id_servicio"].astype(int)
+        ),
+        servicios_prueba=frozenset(
+            servicios.loc[servicios["es_prueba"], "id_servicio"].astype(int)
+        ),
+        novedades_validas=frozenset(
+            novedades.loc[
+                ~novedades["es_prueba"] & ~novedades["servicio_es_prueba"],
+                "id_novedad_evento",
+            ].astype(int)
+        ),
+        novedades_prueba=frozenset(
+            novedades.loc[
+                novedades["es_prueba"], "id_novedad_evento"
+            ].astype(int)
+        ),
+        novedades_servicio_prueba=frozenset(
+            novedades.loc[
+                novedades["servicio_es_prueba"], "id_novedad_evento"
+            ].astype(int)
+        ),
     )
 
 
@@ -359,13 +421,15 @@ def build_dim_cliente(clientes: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def build_dim_mensajero(mensajeros):
+def build_dim_mensajero(mensajeros: pd.DataFrame) -> pd.DataFrame:
     ids = mensajeros["id"].astype("Int64").astype(str)
 
-    return pd.DataFrame({
-        "id_mensajero_nk": ids,
-        "nom_mensajero": "Mensajero " + ids
-    })
+    return pd.DataFrame(
+        {
+            "id_mensajero_nk": ids,
+            "nom_mensajero": "Mensajero " + ids,
+        }
+    )
 
 def build_dim_sede(
     sedes: pd.DataFrame,
@@ -447,7 +511,7 @@ def build_ft_servicio(
     sk_cliente_map: dict[str, int],
     sk_sede_map: dict[str, int],
     sk_mensajero_map: dict[str, int],
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, int, int, int, int]:
     fact = servicios.copy()
     fact["fecha_hora_solicitud"] = combine_date_time(
         fact["fecha_solicitud"], fact["hora_solicitud"]
@@ -463,7 +527,12 @@ def build_ft_servicio(
     user_location = usuarios_sede[
         ["usuario_id", "cliente_id", "sede_id"]
     ].rename(columns={"cliente_id": "cliente_usuario_id"})
-    fact = fact.merge(user_location, on="usuario_id", how="left")
+    fact = fact.merge(
+        user_location,
+        on="usuario_id",
+        how="left",
+        validate="many_to_one",
+    )
 
     cierre = (
         estados_normalizados[estados_normalizados["sk_fase"] == 5]
@@ -478,18 +547,51 @@ def build_ft_servicio(
     )
     fact["id_hora_solicitud"] = fact["fecha_hora_solicitud"].dt.hour.astype(int)
 
-    fact["sk_cliente"] = (
-        fact["cliente_id"].astype(str).map(sk_cliente_map).fillna(0).astype(int)
+    cliente_nk = fact["cliente_id"].astype("Int64").astype(str)
+    cliente_sk = cliente_nk.map(sk_cliente_map)
+    clientes_desconocidos = int(cliente_sk.isna().sum())
+    if clientes_desconocidos:
+        raise ValueError(
+            "Hay servicios cuyo cliente directo no existe en dim_cliente: "
+            f"{clientes_desconocidos}."
+        )
+    fact["sk_cliente"] = cliente_sk.astype(int)
+
+    cliente_servicio = fact["cliente_id"].astype("Int64")
+    cliente_usuario = fact["cliente_usuario_id"].astype("Int64")
+    sede_presente = fact["sede_id"].notna()
+    relacion_presente = cliente_usuario.notna() & sede_presente
+    sede_cliente_inconsistente = relacion_presente & (
+        cliente_servicio != cliente_usuario
     )
-    fact["sk_sede"] = (
-        fact["sede_id"].astype("Int64").astype(str).map(sk_sede_map)
-    )
-    fact["sk_sede"] = fact["sk_sede"].fillna(0).astype(int)
+    sede_sin_relacion = ~relacion_presente
+    sede_cliente_valida = relacion_presente & ~sede_cliente_inconsistente
+
+    sede_nk = fact["sede_id"].astype("Int64").astype(str)
+    sede_sk = sede_nk.map(sk_sede_map)
+    sedes_no_catalogadas = int((sede_cliente_valida & sede_sk.isna()).sum())
+    if sedes_no_catalogadas:
+        raise ValueError(
+            "Hay sedes válidas de la fuente que no existen en dim_sede: "
+            f"{sedes_no_catalogadas}."
+        )
+
+    # Política de calidad: una sede solo se conserva si pertenece al mismo
+    # cliente directo del servicio. Las relaciones ausentes o inconsistentes
+    # se envían al miembro desconocido sin eliminar el servicio.
+    fact["sk_sede"] = sede_sk.where(sede_cliente_valida, 0).fillna(0).astype(int)
 
     mensajero_nk = fact["mensajero_id"].astype("Int64").astype(str)
-    fact["sk_mensajero"] = (
-        mensajero_nk.map(sk_mensajero_map).fillna(0).astype(int)
+    mensajero_sk = mensajero_nk.map(sk_mensajero_map)
+    mensajeros_no_catalogados = int(
+        (fact["mensajero_id"].notna() & mensajero_sk.isna()).sum()
     )
+    if mensajeros_no_catalogados:
+        raise ValueError(
+            "Hay mensajeros informados que no existen en dim_mensajero: "
+            f"{mensajeros_no_catalogados}."
+        )
+    fact["sk_mensajero"] = mensajero_sk.fillna(0).astype(int)
 
     fact["tiempo_entrega_min"] = (
         fact["fecha_hora_cierre"] - fact["fecha_hora_solicitud"]
@@ -517,7 +619,13 @@ def build_ft_servicio(
     if result["id_servicio"].duplicated().any():
         raise ValueError("La transformación produjo servicios duplicados.")
 
-    return result
+    return (
+        result,
+        int(sede_cliente_inconsistente.sum()),
+        int(sede_sin_relacion.sum()),
+        clientes_desconocidos,
+        int((result["sk_mensajero"] == 0).sum()),
+    )
 
 
 def build_ft_fase_servicio(
@@ -539,7 +647,10 @@ def build_ft_fase_servicio(
     chronological = fact["siguiente_timestamp"] >= fact["fecha_hora_inicio"]
     valid_end = consecutive & chronological
 
-    invalid_sequence_count = int((consecutive & ~chronological).sum())
+    # La secuencia es inválida si cualquier fase posterior en el orden del
+    # proceso tiene una marca de tiempo anterior, aunque falte una fase intermedia.
+    has_next = fact["siguiente_timestamp"].notna()
+    invalid_sequence_count = int((has_next & ~chronological).sum())
 
     fact["fecha_hora_fin"] = fact["siguiente_timestamp"].where(valid_end)
     fact["duracion_fase_min"] = (
@@ -650,7 +761,11 @@ def insert_unknown_members(conn: Connection) -> None:
     )
 
 
-def validate_olap(conn: Connection, stats: EtlStats) -> None:
+def validate_olap(
+    conn: Connection,
+    stats: EtlStats,
+    source_ids: SourceIds,
+) -> None:
     validation = pd.read_sql(
         text(
             """
@@ -669,6 +784,15 @@ def validate_olap(conn: Connection, stats: EtlStats) -> None:
                 ) AS servicios_duplicados,
                 (
                     SELECT COUNT(*)
+                    FROM (
+                        SELECT id_servicio, sk_fase
+                        FROM ft_fase_servicio
+                        GROUP BY id_servicio, sk_fase
+                        HAVING COUNT(*) > 1
+                    ) duplicados
+                ) AS fases_duplicadas,
+                (
+                    SELECT COUNT(*)
                     FROM ft_fase_servicio
                     WHERE duracion_fase_min < 0
                 ) AS fases_negativas,
@@ -676,11 +800,118 @@ def validate_olap(conn: Connection, stats: EtlStats) -> None:
                     SELECT COUNT(*)
                     FROM ft_servicio
                     WHERE tiempo_entrega_min < 0
-                ) AS entregas_negativas
+                ) AS entregas_negativas,
+                (
+                    SELECT COUNT(*)
+                    FROM ft_servicio
+                    WHERE fecha_hora_cierre < fecha_hora_solicitud
+                ) AS cierres_anteriores,
+                (
+                    SELECT COUNT(*)
+                    FROM ft_fase_servicio anterior
+                    JOIN ft_fase_servicio posterior
+                      ON posterior.id_servicio = anterior.id_servicio
+                     AND posterior.sk_fase > anterior.sk_fase
+                    WHERE posterior.fecha_hora_inicio < anterior.fecha_hora_inicio
+                ) AS fases_fuera_orden,
+                (
+                    SELECT COUNT(*)
+                    FROM ft_servicio fs
+                    JOIN dim_sede ds ON ds.sk_sede = fs.sk_sede
+                    WHERE fs.sk_sede <> 0
+                      AND fs.sk_cliente <> ds.sk_cliente
+                ) AS cliente_sede_inconsistente,
+                (SELECT COUNT(*) FROM ft_servicio WHERE sk_cliente = 0)
+                    AS clientes_desconocidos,
+                (SELECT COUNT(*) FROM ft_servicio WHERE sk_sede = 0)
+                    AS sedes_desconocidas,
+                (SELECT COUNT(*) FROM ft_servicio WHERE sk_mensajero = 0)
+                    AS mensajeros_desconocidos,
+                (SELECT COUNT(*) FROM ft_novedad_servicio WHERE sk_tipo_novedad = 0)
+                    AS tipos_novedad_desconocidos,
+                (
+                    SELECT COUNT(*)
+                    FROM ft_servicio fs
+                    LEFT JOIN dim_fecha df ON df.sk_fecha = fs.sk_fecha_solicitud
+                    LEFT JOIN dim_hora dh ON dh.id_hora = fs.id_hora_solicitud
+                    LEFT JOIN dim_cliente dc ON dc.sk_cliente = fs.sk_cliente
+                    LEFT JOIN dim_sede ds ON ds.sk_sede = fs.sk_sede
+                    LEFT JOIN dim_mensajero dm ON dm.sk_mensajero = fs.sk_mensajero
+                    WHERE df.sk_fecha IS NULL OR dh.id_hora IS NULL
+                       OR dc.sk_cliente IS NULL OR ds.sk_sede IS NULL
+                       OR dm.sk_mensajero IS NULL
+                ) + (
+                    SELECT COUNT(*)
+                    FROM ft_fase_servicio ffs
+                    LEFT JOIN ft_servicio fs ON fs.id_servicio = ffs.id_servicio
+                    LEFT JOIN dim_fase df ON df.sk_fase = ffs.sk_fase
+                    WHERE fs.id_servicio IS NULL OR df.sk_fase IS NULL
+                ) + (
+                    SELECT COUNT(*)
+                    FROM ft_novedad_servicio fns
+                    LEFT JOIN ft_servicio fs ON fs.id_servicio = fns.id_servicio
+                    LEFT JOIN dim_tipo_novedad dtn
+                      ON dtn.sk_tipo_novedad = fns.sk_tipo_novedad
+                    WHERE fs.id_servicio IS NULL OR dtn.sk_tipo_novedad IS NULL
+                ) AS claves_foraneas_invalidas,
+                (
+                    SELECT COUNT(*)
+                    FROM ft_servicio
+                    WHERE id_servicio IS NULL OR sk_fecha_solicitud IS NULL
+                       OR id_hora_solicitud IS NULL OR sk_cliente IS NULL
+                       OR sk_sede IS NULL OR sk_mensajero IS NULL
+                       OR fecha_hora_solicitud IS NULL OR cantidad_servicios IS NULL
+                ) + (
+                    SELECT COUNT(*)
+                    FROM ft_fase_servicio
+                    WHERE id_servicio IS NULL OR sk_fase IS NULL
+                       OR fecha_hora_inicio IS NULL
+                ) + (
+                    SELECT COUNT(*)
+                    FROM ft_novedad_servicio
+                    WHERE id_novedad_evento IS NULL OR id_servicio IS NULL
+                       OR sk_tipo_novedad IS NULL OR cantidad_novedades IS NULL
+                ) AS nulos_inesperados,
+                (
+                    SELECT COUNT(*)
+                    FROM (VALUES
+                        ((SELECT COUNT(*) FROM dim_cliente WHERE sk_cliente = 0)),
+                        ((SELECT COUNT(*) FROM dim_sede WHERE sk_sede = 0)),
+                        ((SELECT COUNT(*) FROM dim_mensajero WHERE sk_mensajero = 0)),
+                        ((SELECT COUNT(*) FROM dim_tipo_novedad
+                          WHERE sk_tipo_novedad = 0))
+                    ) AS miembros(cantidad)
+                    WHERE cantidad <> 1
+                ) AS miembros_desconocidos_invalidos
             """
         ),
         conn,
     ).iloc[0]
+
+    loaded_service_ids = frozenset(
+        pd.read_sql(text("SELECT id_servicio FROM ft_servicio"), conn)[
+            "id_servicio"
+        ].astype(int)
+    )
+    loaded_novelty_ids = frozenset(
+        pd.read_sql(
+            text("SELECT id_novedad_evento FROM ft_novedad_servicio"), conn
+        )["id_novedad_evento"].astype(int)
+    )
+
+    missing_services = source_ids.servicios_reales - loaded_service_ids
+    extra_services = loaded_service_ids - source_ids.servicios_reales
+    loaded_test_services = loaded_service_ids & source_ids.servicios_prueba
+    missing_novelties = source_ids.novedades_validas - loaded_novelty_ids
+    extra_novelties = loaded_novelty_ids - source_ids.novedades_validas
+    loaded_test_novelties = loaded_novelty_ids & source_ids.novedades_prueba
+    loaded_novelties_from_test_services = (
+        loaded_novelty_ids & source_ids.novedades_servicio_prueba
+    )
+
+    expected_unknown_sites = (
+        stats.sedes_cliente_inconsistentes + stats.sedes_sin_relacion
+    )
 
     print("\nValidación final:")
     print(
@@ -693,28 +924,106 @@ def validate_olap(conn: Connection, stats: EtlStats) -> None:
     )
     print(f"    Fases cargadas: {int(validation['fases']):,}")
     print(f"    Servicios duplicados: {int(validation['servicios_duplicados']):,}")
+    print(f"    Fases duplicadas: {int(validation['fases_duplicadas']):,}")
     print(f"    Duraciones de fase negativas: {int(validation['fases_negativas']):,}")
     print(f"    Tiempos de entrega negativos: {int(validation['entregas_negativas']):,}")
+    print(f"    Cierres anteriores a la solicitud: {int(validation['cierres_anteriores']):,}")
+    print(f"    Fases fuera de orden en OLAP: {int(validation['fases_fuera_orden']):,}")
+    print(f"    Servicios faltantes / extras: {len(missing_services):,} / {len(extra_services):,}")
+    print(f"    Servicios de prueba cargados: {len(loaded_test_services):,}")
+    print(f"    Novedades faltantes / extras: {len(missing_novelties):,} / {len(extra_novelties):,}")
+    print(f"    Novedades de prueba cargadas: {len(loaded_test_novelties):,}")
+    print(
+        "    Novedades de servicios de prueba cargadas: "
+        f"{len(loaded_novelties_from_test_services):,}"
+    )
+    print(
+        "    Relaciones cliente-sede inválidas conservadas: "
+        f"{int(validation['cliente_sede_inconsistente']):,}"
+    )
+    print(
+        "    Sedes enviadas a desconocida por política: "
+        f"{int(validation['sedes_desconocidas']):,}"
+    )
+    print(
+        "    Clientes / mensajeros desconocidos: "
+        f"{int(validation['clientes_desconocidos']):,} / "
+        f"{int(validation['mensajeros_desconocidos']):,}"
+    )
     print(f"    Eventos de fase repetidos detectados: {stats.fases_repetidas:,}")
     print(
         "    Secuencias cronológicas inválidas detectadas: "
         f"{stats.fases_con_secuencia_invalida:,}"
     )
 
-    if int(validation["servicios"]) != stats.servicios_fuente:
-        raise RuntimeError(
-            "La cantidad de servicios cargados no coincide con la fuente."
-        )
-    if int(validation["novedades"]) != stats.novedades_fuente:
-        raise RuntimeError(
-            "La cantidad de novedades cargadas no coincide con la fuente."
-        )
-    if int(validation["servicios_duplicados"]) != 0:
-        raise RuntimeError("Se encontraron servicios duplicados en la OLAP.")
-    if int(validation["fases_negativas"]) != 0:
-        raise RuntimeError("Se encontraron duraciones negativas en las fases.")
-    if int(validation["entregas_negativas"]) != 0:
-        raise RuntimeError("Se encontraron tiempos de entrega negativos.")
+    errors: list[str] = []
+
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            errors.append(message)
+
+    require(
+        int(validation["servicios"]) == stats.servicios_fuente,
+        "La cantidad de servicios cargados no coincide con la fuente.",
+    )
+    require(
+        int(validation["fases"]) == stats.fases_esperadas,
+        "La cantidad de fases cargadas no coincide con las fases normalizadas.",
+    )
+    require(
+        int(validation["novedades"]) == stats.novedades_fuente,
+        "La cantidad de novedades cargadas no coincide con la fuente válida.",
+    )
+    require(not missing_services, "Hay identificadores de servicio faltantes.")
+    require(not extra_services, "Hay identificadores de servicio extras.")
+    require(not loaded_test_services, "Se cargaron servicios de prueba.")
+    require(not missing_novelties, "Hay identificadores de novedad faltantes.")
+    require(not extra_novelties, "Hay identificadores de novedad extras.")
+    require(not loaded_test_novelties, "Se cargaron novedades de prueba.")
+    require(
+        not loaded_novelties_from_test_services,
+        "Se cargaron novedades pertenecientes a servicios de prueba.",
+    )
+
+    zero_validations = {
+        "servicios_duplicados": "Se encontraron servicios duplicados.",
+        "fases_duplicadas": "Se encontraron fases duplicadas por servicio.",
+        "fases_negativas": "Se encontraron duraciones de fase negativas.",
+        "entregas_negativas": "Se encontraron tiempos de entrega negativos.",
+        "cierres_anteriores": "Se encontraron cierres anteriores a la solicitud.",
+        "fases_fuera_orden": "Se encontraron fases fuera de orden.",
+        "cliente_sede_inconsistente": (
+            "Se conservaron relaciones cliente-sede inconsistentes."
+        ),
+        "clientes_desconocidos": "Se encontraron clientes desconocidos.",
+        "tipos_novedad_desconocidos": (
+            "Se encontraron tipos de novedad desconocidos."
+        ),
+        "claves_foraneas_invalidas": "Se encontraron claves foráneas inválidas.",
+        "nulos_inesperados": "Se encontraron NULL inesperados.",
+        "miembros_desconocidos_invalidos": (
+            "Los miembros desconocidos no están definidos exactamente una vez."
+        ),
+    }
+    for field, message in zero_validations.items():
+        require(int(validation[field]) == 0, message)
+
+    require(
+        int(validation["sedes_desconocidas"]) == expected_unknown_sites,
+        "La cantidad de sedes desconocidas no coincide con la política aplicada.",
+    )
+    require(
+        int(validation["mensajeros_desconocidos"])
+        == stats.mensajeros_desconocidos,
+        "La cantidad de mensajeros desconocidos cambió durante la carga.",
+    )
+    require(
+        stats.fases_con_secuencia_invalida == 0,
+        "La fuente contiene secuencias cronológicas inválidas.",
+    )
+
+    if errors:
+        raise RuntimeError("Validaciones críticas fallidas:\n- " + "\n- ".join(errors))
 
 
 # ============================================================
@@ -745,6 +1054,7 @@ def run() -> None:
         usuarios_sede = extract_usuarios_sede(oltp)
         mensajeros = extract_mensajeros(oltp)
         tipos_novedad = extract_tipos_novedad(oltp)
+        source_ids = extract_source_ids(oltp)
 
         print(f"    Servicios: {len(servicios):,}")
         print(f"    Estados: {len(estados):,}")
@@ -801,7 +1111,13 @@ def run() -> None:
             )
 
             print("\n[5/6] Construyendo y cargando hechos...")
-            ft_servicio = build_ft_servicio(
+            (
+                ft_servicio,
+                sedes_cliente_inconsistentes,
+                sedes_sin_relacion,
+                clientes_desconocidos,
+                mensajeros_desconocidos,
+            ) = build_ft_servicio(
                 servicios,
                 usuarios_sede,
                 estados_normalizados,
@@ -809,6 +1125,18 @@ def run() -> None:
                 sk_sede_map,
                 sk_mensajero_map,
             )
+            if sedes_cliente_inconsistentes:
+                print(
+                    "    ADVERTENCIA: "
+                    f"{sedes_cliente_inconsistentes:,} servicios tienen una sede "
+                    "de otro cliente y fueron asignados a Sede desconocida."
+                )
+            if sedes_sin_relacion:
+                print(
+                    "    ADVERTENCIA: "
+                    f"{sedes_sin_relacion:,} servicios no tienen una relación "
+                    "de sede completa y fueron asignados a Sede desconocida."
+                )
             servicios_validos = set(ft_servicio["id_servicio"].astype(int))
 
             ft_fase, secuencias_invalidas = build_ft_fase_servicio(
@@ -829,12 +1157,20 @@ def run() -> None:
                 servicios_fuente=len(servicios),
                 estados_fuente=len(estados),
                 novedades_fuente=len(novedades),
+                fases_esperadas=len(ft_fase),
                 fases_repetidas=fases_repetidas,
                 fases_con_secuencia_invalida=secuencias_invalidas,
+                sedes_cliente_inconsistentes=sedes_cliente_inconsistentes,
+                sedes_sin_relacion=sedes_sin_relacion,
+                clientes_desconocidos=clientes_desconocidos,
+                sedes_desconocidas=(
+                    sedes_cliente_inconsistentes + sedes_sin_relacion
+                ),
+                mensajeros_desconocidos=mensajeros_desconocidos,
             )
 
             print("\n[6/6] Validando la carga...")
-            validate_olap(conn, stats)
+            validate_olap(conn, stats, source_ids)
 
         print("\n" + "=" * 68)
         print(" ETL completado correctamente.")
