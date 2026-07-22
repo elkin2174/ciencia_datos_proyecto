@@ -103,16 +103,25 @@ class SourceIds:
 # UTILIDADES
 # ============================================================
 
-def require_configuration() -> None:
-    missing = [
-        name
-        for name, value in (("OLTP_URI", OLTP_URI), ("OLAP_URI", OLAP_URI))
-        if not value
-    ]
+def require_configuration() -> tuple[str, str]:
+    missing: list[str] = []
+
+    if not OLTP_URI:
+        missing.append("OLTP_URI")
+
+    if not OLAP_URI:
+        missing.append("OLAP_URI")
+
     if missing:
         raise RuntimeError(
-            "Faltan variables en el archivo .env: " + ", ".join(missing)
+            "Faltan variables de configuración: " + ", ".join(missing)
         )
+
+    # Después de las validaciones, ambas variables son str.
+    assert OLTP_URI is not None
+    assert OLAP_URI is not None
+
+    return OLTP_URI, OLAP_URI
 
 
 def test_connections(oltp: Engine, olap: Engine) -> None:
@@ -371,24 +380,49 @@ def extract_source_ids(engine: Engine) -> SourceIds:
 # ============================================================
 
 def build_dim_fecha(servicios: pd.DataFrame) -> pd.DataFrame:
-    fechas = pd.to_datetime(servicios["fecha_solicitud"], errors="coerce").dropna()
-    if fechas.empty:
-        raise ValueError("No hay fechas de solicitud válidas en la OLTP.")
+    fechas = pd.to_datetime(
+        servicios["fecha_solicitud"],
+        errors="coerce",
+    )
 
-    # Calendario continuo entre la primera y la última solicitud.
-    rango = pd.date_range(fechas.min().date(), fechas.max().date(), freq="D")
+    fechas_validas = fechas.dropna()
+
+    if fechas_validas.empty:
+        raise ValueError("No hay fechas válidas para construir dim_fecha.")
+
+    rango = pd.date_range(
+        start=fechas_validas.min(),
+        end=fechas_validas.max(),
+        freq="D",
+    )
+
     dim = pd.DataFrame({"fecha": rango})
-    dim["sk_fecha"] = dim["fecha"].dt.strftime("%Y%m%d").astype(int)
+
+    # Clave de fecha con formato YYYYMMDD.
+    dim["sk_fecha"] = (
+        dim["fecha"]
+        .dt.strftime("%Y%m%d")
+        .astype("int64")
+    )
+
     dim["dia"] = dim["fecha"].dt.day
     dim["dia_semana_num"] = dim["fecha"].dt.weekday + 1
-    dim["dia_semana"] = dim["fecha"].dt.weekday.map(
-        lambda value: DIAS_ES[int(value)]
-    )
+
+    mapa_dias = dict(enumerate(DIAS_ES))
+    dim["dia_semana"] = dim["fecha"].dt.weekday.map(mapa_dias)
+
     dim["mes"] = dim["fecha"].dt.month
-    dim["mes_nombre"] = dim["mes"].map(lambda value: MESES_ES[int(value)])
+
+    mapa_meses = dict(enumerate(MESES_ES))
+    dim["mes_nombre"] = dim["mes"].map(mapa_meses)
+
     dim["trimestre"] = dim["fecha"].dt.quarter
     dim["anio"] = dim["fecha"].dt.year
+
+    # Actualmente el proyecto no carga un calendario de festivos.
     dim["es_festivo"] = False
+
+    # PostgreSQL recibe la fecha sin componente de hora.
     dim["fecha"] = dim["fecha"].dt.date
 
     return dim[
@@ -396,8 +430,8 @@ def build_dim_fecha(servicios: pd.DataFrame) -> pd.DataFrame:
             "sk_fecha",
             "fecha",
             "dia",
-            "dia_semana",
             "dia_semana_num",
+            "dia_semana",
             "mes",
             "mes_nombre",
             "trimestre",
@@ -405,7 +439,6 @@ def build_dim_fecha(servicios: pd.DataFrame) -> pd.DataFrame:
             "es_festivo",
         ]
     ]
-
 
 def build_dim_cliente(clientes: pd.DataFrame) -> pd.DataFrame:
     result = clientes.rename(
@@ -535,11 +568,13 @@ def build_ft_servicio(
     )
 
     cierre = (
-        estados_normalizados[estados_normalizados["sk_fase"] == 5]
-        .groupby("id_servicio", as_index=False)["fecha_hora_inicio"]
-        .max()
-        .rename(columns={"fecha_hora_inicio": "fecha_hora_cierre"})
-    )
+    estados_normalizados.loc[
+        estados_normalizados["sk_fase"].eq(5),
+        ["id_servicio", "fecha_hora_inicio"],
+    ]
+    .groupby("id_servicio", as_index=False)
+    .agg(fecha_hora_cierre=("fecha_hora_inicio", "max"))
+)
     fact = fact.merge(cierre, on="id_servicio", how="left")
 
     fact["sk_fecha_solicitud"] = (
@@ -1035,10 +1070,10 @@ def run() -> None:
     print(" ETL Fast and Safe: aquitoy_2 -> olap_fastandsafe")
     print("=" * 68)
 
-    require_configuration()
+    oltp_uri, olap_uri = require_configuration()
 
-    oltp = create_engine(OLTP_URI, pool_pre_ping=True)
-    olap = create_engine(OLAP_URI, pool_pre_ping=True)
+    oltp = create_engine(oltp_uri, pool_pre_ping=True)
+    olap = create_engine(olap_uri, pool_pre_ping=True)
 
     try:
         print("\n[1/6] Probando conexiones...")

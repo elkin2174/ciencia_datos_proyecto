@@ -6,17 +6,46 @@
 
 \set ON_ERROR_STOP on
 \pset pager off
+\pset border 2
+\pset null 'NULL'
 \timing on
 
--- Conteos de control. Esta sección se ejecuta una sola vez.
-SELECT 'ft_servicio' AS tabla, COUNT(*) AS registros
+\echo ''
+\echo '===================================================================='
+\echo ' FAST AND SAFE - CONSULTAS ANALITICAS OLAP'
+\echo ' Base de datos: olap_fastandsafe'
+\echo '===================================================================='
+
+
+-- ============================================================
+-- CONTEOS DE CONTROL
+-- Esta sección se ejecuta una sola vez.
+-- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' CONTROL INICIAL: CONTEO DE REGISTROS EN LAS TABLAS DE HECHOS'
+\echo '===================================================================='
+
+SELECT
+    'ft_servicio' AS tabla,
+    COUNT(*) AS registros
 FROM ft_servicio
+
 UNION ALL
-SELECT 'ft_fase_servicio', COUNT(*)
+
+SELECT
+    'ft_fase_servicio',
+    COUNT(*)
 FROM ft_fase_servicio
+
 UNION ALL
-SELECT 'ft_novedad_servicio', COUNT(*)
+
+SELECT
+    'ft_novedad_servicio',
+    COUNT(*)
 FROM ft_novedad_servicio
+
 ORDER BY tabla;
 
 
@@ -25,6 +54,12 @@ ORDER BY tabla;
 -- Se separan año y mes para no mezclar períodos de años distintos.
 -- Grano usado: una fila de ft_servicio por servicio.
 -- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' P1. MESES CON MAYOR CANTIDAD DE SERVICIOS'
+\echo '===================================================================='
+
 SELECT
     df.anio,
     df.mes,
@@ -47,6 +82,12 @@ ORDER BY
 -- P2. Días de la semana con mayor cantidad de servicios
 -- COUNT(*) es correcto porque ft_servicio tiene una fila por servicio.
 -- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' P2. DIAS DE LA SEMANA CON MAYOR CANTIDAD DE SERVICIOS'
+\echo '===================================================================='
+
 SELECT
     df.dia_semana_num,
     df.dia_semana,
@@ -69,6 +110,14 @@ ORDER BY
 -- la hora de solicitud únicamente en servicios con mensajero asignado; no es
 -- la hora exacta de asignación.
 -- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' P3. DEMANDA DE MENSAJEROS POR HORA DE SOLICITUD'
+\echo '===================================================================='
+\echo ' Nota: utiliza la hora de solicitud como aproximacion.'
+\echo ''
+
 SELECT
     dh.hora_24,
     dh.franja_horaria,
@@ -89,6 +138,12 @@ ORDER BY
 -- P4. Servicios por cliente y mes
 -- Se agrupa por la clave natural y el nombre del cliente.
 -- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' P4. CANTIDAD DE SERVICIOS POR CLIENTE Y MES'
+\echo '===================================================================='
+
 SELECT
     dc.id_cliente_nk,
     dc.nom_cliente,
@@ -119,6 +174,14 @@ ORDER BY
 -- P5. Mensajeros con mayor cantidad de servicios
 -- Los nombres técnicos Mensajero <id> evitan exponer datos personales.
 -- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' P5. MENSAJEROS CON MAYOR CANTIDAD DE SERVICIOS'
+\echo '===================================================================='
+\echo ' Nota: esta consulta mide volumen, no eficiencia integral.'
+\echo ''
+
 SELECT
     dm.id_mensajero_nk,
     dm.nom_mensajero,
@@ -141,6 +204,12 @@ ORDER BY
 -- iguales. Se excluyen miembros desconocidos y relaciones inconsistentes.
 -- DENSE_RANK conserva empates en la primera posición.
 -- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' P6. SEDE CON MAYOR CANTIDAD DE SERVICIOS PARA CADA CLIENTE'
+\echo '===================================================================='
+
 WITH servicios_por_sede AS (
     SELECT
         dc.sk_cliente,
@@ -197,6 +266,14 @@ ORDER BY
 -- P7. Tiempo promedio entre solicitud y cierre
 -- Solo se consideran servicios que tienen un cierre válido disponible.
 -- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' P7. TIEMPO PROMEDIO ENTRE LA SOLICITUD Y EL CIERRE'
+\echo '===================================================================='
+\echo ' Nota: solo considera servicios que tienen un cierre valido.'
+\echo ''
+
 SELECT
     ROUND(AVG(tiempo_entrega_min), 2) AS promedio_minutos,
     ROUND(AVG(tiempo_entrega_min) / 60.0, 2) AS promedio_horas,
@@ -213,6 +290,15 @@ WHERE fecha_hora_cierre IS NOT NULL
 -- marca como insuficiente y no puede ser declarada cuello de botella robusto.
 -- En la fuente actual, "Con mensajero asignado" solo tiene una observación.
 -- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' P8. TIEMPO PROMEDIO POR FASE Y PRINCIPAL CUELLO DE BOTELLA'
+\echo '===================================================================='
+\echo ' Nota: solo una fase con 30 o mas observaciones puede considerarse'
+\echo '       un cuello de botella con muestra suficiente.'
+\echo ''
+
 WITH promedio_fase AS (
     SELECT
         dfase.id_fase_nk,
@@ -231,7 +317,8 @@ WITH promedio_fase AS (
 evaluacion AS (
     SELECT
         promedio_fase.*,
-        MAX(promedio_minutos) FILTER (WHERE observaciones >= 30) OVER ()
+        MAX(promedio_minutos)
+            FILTER (WHERE observaciones >= 30) OVER ()
             AS mayor_promedio_con_muestra_suficiente
     FROM promedio_fase
 )
@@ -247,7 +334,7 @@ SELECT
     CASE
         WHEN observaciones >= 30
          AND promedio_minutos = mayor_promedio_con_muestra_suficiente
-        THEN 'Sí'
+        THEN 'Si'
         ELSE 'No'
     END AS es_principal_cuello_botella
 FROM evaluacion
@@ -261,6 +348,15 @@ ORDER BY
 -- Se cuenta una fila por evento, se excluye el tipo desconocido y se muestra
 -- su participación sobre las novedades válidas. La muestra actual es de siete.
 -- ============================================================
+
+\echo ''
+\echo '===================================================================='
+\echo ' P9. TIPOS DE NOVEDADES MAS FRECUENTES'
+\echo '===================================================================='
+\echo ' Nota: los porcentajes deben interpretarse considerando el tamano'
+\echo '       reducido de la muestra.'
+\echo ''
+
 WITH novedades_por_tipo AS (
     SELECT
         dtn.id_tipo_novedad_nk,
@@ -287,3 +383,9 @@ FROM novedades_por_tipo
 ORDER BY
     cantidad_novedades DESC,
     id_tipo_novedad_nk;
+
+
+\echo ''
+\echo '===================================================================='
+\echo ' FIN DE LAS CONSULTAS ANALITICAS'
+\echo '===================================================================='
